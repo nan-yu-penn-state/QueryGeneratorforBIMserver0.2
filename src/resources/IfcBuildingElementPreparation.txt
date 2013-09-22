@@ -1,0 +1,40 @@
+package org.bimserver.querycompiler;
+
+import java.io.PrintWriter;
+import org.bimserver.plugins.serializers.IfcModelInterface;
+import java.util.*;
+
+
+import org.bimserver.models.ifc2x3tc1.*;
+
+public class Query implements QueryInterface {
+
+    private IfcModelInterface model;
+    private PrintWriter out;
+    private List<Double> list_of_storey_elevation=new ArrayList();
+
+    @Override
+    public void query(IfcModelInterface model, PrintWriter out) {
+        List<IfcBuildingStorey> stories = model.getAll(IfcBuildingStorey.class);
+        Map<Double, IfcBuildingStorey> orderedStories = new TreeMap<Double, IfcBuildingStorey>();
+        
+        this.list_of_storey_elevation=new ArrayList();
+        
+        for (IfcBuildingStorey storey : stories) {
+            orderedStories.put(storey.getElevation(), storey);
+            this.list_of_storey_elevation.add(storey.getElevation());
+            System.out.println("storey elevation: " + storey.getElevation());
+        }
+        
+        Collections.sort(this.list_of_storey_elevation);
+        
+        for(Double d:this.list_of_storey_elevation){
+            System.out.println("after sorting:"+d);
+        }
+        
+        if (orderedStories.size() >= 1) {
+            for (Double key : this.list_of_storey_elevation) {
+                System.out.println("number of stories " + orderedStories.size());
+                IfcBuildingStorey floor = orderedStories.get(key);
+                for (IfcRelContainedInSpatialStructure rel : floor.getContainsElements()) { 
+                    for (IfcProduct product : rel.getRelatedElements()) {

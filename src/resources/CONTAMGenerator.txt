@@ -1,0 +1,328 @@
+package org.bimserver.querycompiler;
+
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileWriter;
+import java.io.PrintWriter;
+import org.bimserver.plugins.serializers.IfcModelInterface;
+import java.util.*;
+import org.bimserver.models.ifc2x3tc1.*;
+
+public class Query implements QueryInterface {
+
+	private IfcModelInterface model;
+	private PrintWriter out;
+	private String outputPath;
+	private StringBuffer outputContent = new StringBuffer();
+	private StringBuffer missingContent = new StringBuffer();
+
+	@Override
+	public void query(IfcModelInterface model, PrintWriter out) {
+		outputContent.append("{\n");
+		missingContent.append("{\n");
+		
+		/**sequence
+		 * level-preprocessor must come before zones, 
+		 * zones must come before levels,
+		 * levels must come before walls
+		 *  */
+		
+		/**ahs*/
+		missingContent.append("\t\"ahs\": [{\n");
+		missingContent.append("\t\t\"name\":\"ahs\",\n");				//user input: default value
+		missingContent.append("\t\t\"outdoorAirPercent\": 15\n");		//user input: default value
+		missingContent.append("\t}],\n");
+		
+		/**levels - preprocessor*/
+		List<IfcBuildingStorey> ifcBuildingStoreyList = model.getAll(IfcBuildingStorey.class);
+		Map<String, Double> levelElevationMap = new HashMap<String, Double>();
+		Map<String, Double> levelHeightMap = new HashMap<String, Double>();
+		
+		for(IfcBuildingStorey ifcBuildingStorey:  ifcBuildingStoreyList){
+			levelHeightMap.put(ifcBuildingStorey.getName(), 0.0);
+		}
+		
+		/**zones*/
+		outputContent.append("\t\"zones\": [\n");
+		missingContent.append("\t\"zones\": [\n");
+		List<IfcSpace> ifcSpaceList = model.getAll(IfcSpace.class);
+		for(int i = 0; i < ifcSpaceList.size(); i ++){
+			IfcSpace ifcSpace = ifcSpaceList.get(i);
+			outputContent.append("\t\t{\n");
+			
+			Double height = 0.0;
+			String levelName = "";
+			for(int j = 0; j < ifcSpace.getIsDefinedBy().size(); j ++){
+				IfcRelDefinesByProperties ifcRelDefinesByProperties = (IfcRelDefinesByProperties) ifcSpace.getIsDefinedBy().get(j);
+				if(ifcRelDefinesByProperties.getRelatingPropertyDefinition().getName().equals("Dimensions")){
+					List<IfcProperty> ifcPropertySetList = ((IfcPropertySet)ifcRelDefinesByProperties.getRelatingPropertyDefinition()).getHasProperties();
+					for(int k = 0; k < ifcPropertySetList.size(); k ++){
+						IfcPropertySingleValue ifcPropertySingleValue = (IfcPropertySingleValue)ifcPropertySetList.get(k);
+						if(ifcPropertySingleValue.getName().equals("Volume")){
+							outputContent.append("\t\t\t\"volume\": ");
+							outputContent.append(((IfcVolumeMeasure)ifcPropertySingleValue.getNominalValue()).getWrappedValue() * 0.028);	//units transformation: cubic feet to cubic meter
+							outputContent.append(",\n");
+						}
+						else if(ifcPropertySingleValue.getName().equals("Unbounded Height")){
+							height = ((IfcLengthMeasure)ifcPropertySingleValue.getNominalValue()).getWrappedValue() * 0.3;		//unit transformation: feet to meter
+						}
+					}
+				}
+				else if(ifcRelDefinesByProperties.getRelatingPropertyDefinition().getName().equals("Constraints")){
+					List<IfcProperty> ifcPropertySetList = ((IfcPropertySet)ifcRelDefinesByProperties.getRelatingPropertyDefinition()).getHasProperties();
+					for(int k = 0; k < ifcPropertySetList.size(); k ++){
+						IfcPropertySingleValue ifcPropertySingleValue = (IfcPropertySingleValue)ifcPropertySetList.get(k);
+						if(ifcPropertySingleValue.getName().equals("Level")){
+							outputContent.append("\t\t\t\"level\": \"");
+							levelName = ((IfcLabel)ifcPropertySingleValue.getNominalValue()).getWrappedValue();
+							outputContent.append(levelName);
+							outputContent.append("\",\n");
+						}
+					}
+				}
+			}
+			
+			outputContent.append("\t\t\t\"name\": \"");
+			outputContent.append(ifcSpace.getName().replaceAll("\"", ""));
+			outputContent.append("\"\n");				// No colon
+			
+			missingContent.append("\t\t{\n");
+			missingContent.append("\t\t\t\"name\": \"");
+			missingContent.append(ifcSpace.getName().replaceAll("\"", ""));
+			missingContent.append("\",\n");			//has colon
+			
+			if(height > levelHeightMap.get(levelName)){		//prepare for the height of each level
+				levelHeightMap.put(levelName, height);
+			}
+			
+			missingContent.append("\t\t\t\"supplyAir\": [\n");
+			missingContent.append("\t\t\t\t{\n\t\t\t\t\t\"system\": \"ahs\",\n"); 	//user input, default value
+			missingContent.append("\t\t\t\t\t\"flow\":\n\t\t\t\t\t{\n"); 		
+			missingContent.append("\t\t\t\t\t\t\"value\": 380,\n"); 				//user input, default value
+			missingContent.append("\t\t\t\t\t\t\"units\":\"scfm\"\n"); 				//user input, default value
+			missingContent.append("\t\t\t\t\t}\n\t\t\t\t}\n"); 					
+			missingContent.append("\t\t\t],\n");
+			
+			missingContent.append("\t\t\t\"returnAir\": [\n");
+			missingContent.append("\t\t\t\t{\n\t\t\t\t\t\"system\": \"ahs\",\n"); 	//user input, default value
+			missingContent.append("\t\t\t\t\t\"flow\":\n\t\t\t\t\t{\n"); 		
+			missingContent.append("\t\t\t\t\t\t\"value\": 380,\n"); 				//user input, default value
+			missingContent.append("\t\t\t\t\t\t\"units\":\"scfm\"\n"); 				//user input, default value
+			missingContent.append("\t\t\t\t\t}\n\t\t\t\t}\n");					
+			missingContent.append("\t\t\t]\n");
+			
+			
+			outputContent.append("\t\t}");
+			missingContent.append("\t\t}");
+			if(i < ifcSpaceList.size() - 1){
+				outputContent.append(",\n");
+				missingContent.append(",\n");
+			}
+			else{
+				outputContent.append("\n");
+				missingContent.append("\n");
+			}
+		}
+		outputContent.append("\t],\n"); 
+		missingContent.append("\t],\n"); 
+
+		
+		/**levels*/
+		outputContent.append("\t\"levels\": [\n");
+		
+		for(int i = 0; i < ifcBuildingStoreyList.size(); i ++){
+			Double elevation = 0.0;
+			IfcBuildingStorey ifcBuildingStorey = ifcBuildingStoreyList.get(i);
+			outputContent.append("\t\t{\n");
+			outputContent.append("\t\t\t\"elevation\": ");
+			for(int j = 0; j < ifcBuildingStorey.getIsDefinedBy().size(); j ++){
+				IfcRelDefinesByProperties ifcRelDefinesByProperties = (IfcRelDefinesByProperties) ifcBuildingStorey.getIsDefinedBy().get(j);
+				if(ifcRelDefinesByProperties.getRelatingPropertyDefinition().getName().equals("Constraints")){
+					List<IfcProperty> ifcPropertySetList = ((IfcPropertySet)ifcRelDefinesByProperties.getRelatingPropertyDefinition()).getHasProperties();
+					for(int k = 0; k < ifcPropertySetList.size(); k ++){
+						IfcPropertySingleValue ifcPropertySingleValue = (IfcPropertySingleValue)ifcPropertySetList.get(k);
+						if(ifcPropertySingleValue.getName().equals("Elevation")){
+							elevation = ((IfcLengthMeasure)ifcPropertySingleValue.getNominalValue()).getWrappedValue() * 0.3;	//unit transformation: feet to meter
+							outputContent.append(elevation);
+						}
+					}
+				}
+			}
+			outputContent.append(",\n");
+			
+			outputContent.append("\t\t\t\"name\": \"");
+			String levelName = ifcBuildingStorey.getName();
+			outputContent.append(levelName.replaceAll("\"", ""));
+			outputContent.append("\",\n");
+			
+			outputContent.append("\t\t\t\"height\": ");
+			outputContent.append(levelHeightMap.get(levelName)); 	
+			outputContent.append("\n\t\t}");
+			if(i < ifcBuildingStoreyList.size() - 1){
+				outputContent.append(",\n");
+			}
+			else{
+				outputContent.append("\n");
+			}
+			
+			levelElevationMap.put(levelName, elevation);
+		}
+		outputContent.append("\t],\n");
+
+		
+		/**walls*/
+		outputContent.append("\t\"walls\": [\n");
+		missingContent.append("\t\"walls\": [\n");
+		List<IfcWallStandardCase> ifcWallStandardCaseList = model.getAll(IfcWallStandardCase.class);
+		for(int i = 0; i < ifcWallStandardCaseList.size(); i ++){
+			IfcWallStandardCase ifcWallStandardCase = ifcWallStandardCaseList.get(i);
+			String wallName = ifcWallStandardCase.getName().replaceAll("\"", "");
+			outputContent.append("\t\t{\n");
+			outputContent.append("\t\t\t\"name\": \"");
+			outputContent.append(wallName);
+			outputContent.append("\",\n");
+			
+			for(int j = 0; j < ifcWallStandardCase.getIsDefinedBy().size(); j ++){
+				IfcRelDefinesByProperties ifcRelDefinesByProperties = (IfcRelDefinesByProperties) ifcWallStandardCase.getIsDefinedBy().get(j);
+				if(ifcRelDefinesByProperties.getRelatingPropertyDefinition().getName().equals("Dimensions")){
+					List<IfcProperty> ifcPropertySetList = ((IfcPropertySet)ifcRelDefinesByProperties.getRelatingPropertyDefinition()).getHasProperties();
+					for(int k = 0; k < ifcPropertySetList.size(); k ++){
+						IfcPropertySingleValue ifcPropertySingleValue = (IfcPropertySingleValue)ifcPropertySetList.get(k);
+						if(ifcPropertySingleValue.getName().equals("Area")){
+							outputContent.append("\t\t\t\"area\": ");
+							outputContent.append(((IfcAreaMeasure)ifcPropertySingleValue.getNominalValue()).getWrappedValue() * 0.09);	//unit transformation: square feet to square meter
+							outputContent.append(",\n");
+						}
+					}
+				}
+				else if(ifcRelDefinesByProperties.getRelatingPropertyDefinition().getName().equals("Constraints")){
+					List<IfcProperty> ifcPropertySetList = ((IfcPropertySet)ifcRelDefinesByProperties.getRelatingPropertyDefinition()).getHasProperties();
+					String levelName = "";
+					Double elevation = 0.0;
+					for(int k = 0; k < ifcPropertySetList.size(); k ++){
+						IfcPropertySingleValue ifcPropertySingleValue = (IfcPropertySingleValue)ifcPropertySetList.get(k);
+						if(ifcPropertySingleValue.getName().equals("Base Constraint")){
+							levelName = ((IfcLabel)ifcPropertySingleValue.getNominalValue()).getWrappedValue();
+						}
+						else if(ifcPropertySingleValue.getName().equals("Unconnected Height")){
+							elevation = ((IfcLengthMeasure)ifcPropertySingleValue.getNominalValue()).getWrappedValue() * 0.3 / 2;
+						}
+					}
+					elevation += levelElevationMap.get(levelName);
+					outputContent.append("\t\t\t\"level\": \"");
+					outputContent.append(levelName);
+					outputContent.append("\",\n");
+					outputContent.append("\t\t\t\"elevation\": ");
+					outputContent.append(elevation);
+					outputContent.append(",\n");
+				}
+			}
+			
+			outputContent.append("\t\t\t\"zones\": [\n");
+			//TODO: a wall can have at most two connected zones
+			List<IfcRelSpaceBoundary> ifcRelSpaceBoundaryList = (ifcWallStandardCase.getProvidesBoundaries().size() > 2) ? ifcWallStandardCase.getProvidesBoundaries().subList(0, 2) : ifcWallStandardCase.getProvidesBoundaries();
+			for(int j = 0; j < ifcRelSpaceBoundaryList.size(); j ++){
+				IfcRelSpaceBoundary ifcRelSpaceBoundary = ifcRelSpaceBoundaryList.get(j);
+				outputContent.append("\t\t\t\t\"");
+				outputContent.append(ifcRelSpaceBoundary.getRelatingSpace().getName());
+				if(j < ifcRelSpaceBoundaryList.size() - 1){
+					outputContent.append("\",\n");
+				}
+				else{
+					outputContent.append("\"\n");
+				}
+			}
+			outputContent.append("\t\t\t]\n");			//end of zones:[
+			
+			if(wallName.contains("Exterior")){
+				missingContent.append("\t\t{\n");
+				missingContent.append("\t\t\t\"name\": \"");
+				missingContent.append(wallName);
+				missingContent.append("\",\n");
+				missingContent.append("\t\t\t\"azimuth\": 80\n");		//user input, default value
+				missingContent.append("\t\t}");
+				if(i < ifcWallStandardCaseList.size() - 1){
+					missingContent.append(",\n");
+				}
+				else{
+					missingContent.append("\n");
+				}
+			}
+			
+			outputContent.append("\t\t}");
+			if(i < ifcWallStandardCaseList.size() - 1){
+				outputContent.append(",\n");
+			}
+			else{
+				outputContent.append("\n");
+			}
+		}
+		
+		outputContent.append("\t],\n");			//end of walls:[
+		missingContent.append("\t]\n");			//end of walls:[		
+
+		
+		/**Project Name and Description*/
+		List<IfcProject> ifcProjectList = model.getAll(IfcProject.class);
+		IfcProject ifcProject = ifcProjectList.get(0);
+		String name = ifcProject.getName();
+		String description = ifcProject.getDescription();
+		outputContent.append("\t\"name\": \"");
+		outputContent.append((name == null) ? name : name.replaceAll("\"", ""));
+		outputContent.append("\",\n");
+		
+		outputContent.append("\t\"description\": \"");
+		outputContent.append((description == null) ? description : description.replaceAll("\"", ""));
+		outputContent.append("\"\n");
+		
+		outputContent.append("}");
+		missingContent.append("}");
+		
+		out.println(outputContent.toString());
+		saveOutput(model.getName());
+	}
+	
+	private void isOutputPathExist() {
+		File file = new File(outputPath);
+		if (!file.exists()) {
+			file.mkdirs();
+		}
+	}
+	
+	private void saveOutput(String modelName){
+		Properties property = System.getProperties();    
+		String osName = property.getProperty("os.name");    
+		if(osName.equalsIgnoreCase("Linux")){
+			outputPath = "/tmp/BIM/CONTAM/jsons/";
+		}
+		else if (osName.startsWith("Windows")) {
+			outputPath = "C:\\tmp\\BIM\\CONTAM\\jsons\\";
+		}
+		
+		FileWriter fstream = null;
+                BufferedWriter bufferWriter = null;
+		try {
+			isOutputPathExist();
+			String queriedFileName = outputPath + modelName +  ".airflow.queried.json";
+			fstream = new FileWriter(queriedFileName);
+			bufferWriter = new BufferedWriter(fstream);
+			bufferWriter.write(outputContent.toString());
+			bufferWriter.close();
+			
+			String missingFileName = outputPath + modelName +  ".airflow.missing.json";
+			fstream = new FileWriter(missingFileName);
+			bufferWriter = new BufferedWriter(fstream);
+			bufferWriter.write(missingContent.toString());
+			bufferWriter.close();
+			
+		} catch (Exception e) {
+			e.printStackTrace();
+		} finally {
+			try {
+				bufferWriter.close();
+			} catch (Exception e) {
+				e.printStackTrace();
+			}
+		}
+	}
+}

@@ -1,0 +1,819 @@
+package org.bimserver.querycompiler;
+
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileWriter;
+import java.io.PrintWriter;
+import org.bimserver.plugins.serializers.IfcModelInterface;
+import java.util.*;
+import org.bimserver.models.ifc2x3tc1.*;
+
+public class Query implements QueryInterface {
+
+	private PrintWriter out;
+	private List<Point> currentAxisPoints = new ArrayList<Point>();		//current axis points
+	private Double currentStoreyHeight; // current height of the storey
+	private String outputPath;
+	private StringBuffer outputContent = new StringBuffer();
+	private IfcObject currentInstance; 		//current instance
+	private Map<String, String> spaceNameMap = new HashMap<String, String>();		//space name map for OpenStudio. 
+								//key is the space name from IFC, value is the space name for OSM
+	private List<Point> allPoints = new ArrayList<Point>();			//all points in order to replace close ones
+	private List<OSMSpace> spaceList = new ArrayList<OSMSpace>();	//all spaces
+	private List<OSMSurface> surfaceList = new ArrayList<OSMSurface>();	//all surfaces: walls, roofceilings, floors
+	private final static Double THRESHOLD = 2.0;		// gap threshold
+	
+	@Override
+	public void query(IfcModelInterface model, PrintWriter out) {
+		this.out = out;
+		
+		List<IfcBuildingStorey> stories = model.getAll(IfcBuildingStorey.class);
+		Map<Double, IfcBuildingStorey> orderedStories = new TreeMap<Double, IfcBuildingStorey>();
+		List<Double> list_of_storey_elevation = new ArrayList<Double>();
+		
+		for (IfcBuildingStorey storey : stories) {
+			orderedStories.put(storey.getElevation(), storey);
+			list_of_storey_elevation.add(storey.getElevation());
+		}
+
+		Collections.sort(list_of_storey_elevation);
+		
+		if (orderedStories.size() >= 1) {
+			for (Double key : list_of_storey_elevation) {
+				IfcBuildingStorey storey = orderedStories.get(key);
+				System.out.println("Storey level " + storey.getName());
+				currentStoreyHeight = storey.getElevation();
+				for (IfcRelContainedInSpatialStructure rel : storey.getContainsElements()) {
+					for (IfcProduct product : rel.getRelatedElements()) {
+						if (product instanceof IfcWall) {
+							this.wallGeometryInfo(product);
+						}
+					}
+				}
+			}
+		}
+		replaceClosePoints();
+		transformUnits();
+		generateOutput();
+		saveOutputToFile(model.getName());
+	}
+	
+	private void wallGeometryInfo(IfcProduct product){
+		IfcWall ifcWallinstance = (IfcWall) product;
+		currentInstance = ifcWallinstance;
+		String surfaceName = "";
+		OSMSurface osmSurface = new OSMSurface();
+		
+		List<IfcRelSpaceBoundary> ifcRelSpaceBoundaryList = ifcWallinstance.getProvidesBoundaries();
+		List<IfcRepresentation> representations = ifcWallinstance.getRepresentation().getRepresentations();
+		for(IfcRepresentation representation: representations) {
+			if(representation.getRepresentationIdentifier().equals("Axis")){
+//				out.print("    Axis information: ");
+				wallAxisInfo(representation);
+			}
+			else if(representation.getRepresentationIdentifier().equals("Body")){
+//				out.print("    Body information: ");
+				surfaceName = "su-" + (surfaceList.size() + 1);
+				osmSurface.setSurfaceName(surfaceName);
+				osmSurface.setTypeName("Wall");
+				osmSurface.setSpaceName("sp-111-Space");
+				osmSurface.setOutsideBoundaryCondition("Outdoors");
+				osmSurface.setSunExposure("SunExposed");
+				osmSurface.setWindExposure("WindExposed");
+				
+				wallBodyInfo(representation, osmSurface);
+			}
+			else
+				System.out.println("    Unknown representation type");
+		}
+	}
+	
+	private void wallAxisInfo(IfcRepresentation representation) {
+		IfcRepresentationItem item = representation.getItems().get(0); //IfcWall Axis Representation only contains one item
+		currentAxisPoints = new ArrayList<Point>();
+		if(item instanceof IfcPolyline){ 
+//			out.println("IfcPolyline");
+			polylineInfo((IfcPolyline)item);
+		}
+		else if (item instanceof IfcTrimmedCurve) {
+//			out.println("IfcTrimmedCurve");
+			trimmedCurveInfo((IfcTrimmedCurve)item);
+		}
+		else
+			System.out.println("unknown Axis type");
+	}
+	
+	private void polylineInfo(IfcPolyline ifcPolyline) {
+		for(IfcCartesianPoint point : ifcPolyline.getPoints()) {
+			List<Double> pointAxis = point.getCoordinates();	//axis relative point
+			currentAxisPoints.add(new Point(pointAxis.get(0), pointAxis.get(1), currentStoreyHeight));		//add to axisPoints, which is used by sweptSolidWallInfor and clippingWallInfo
+		}
+	}
+	
+	private void trimmedCurveInfo(IfcTrimmedCurve ifcTrimmedCurve) {
+		//Haven't met
+	}
+	
+	private void wallBodyInfo(IfcRepresentation representation, OSMSurface osmSurface) {
+		if(currentAxisPoints.size() > 0){
+			if(representation.getRepresentationType().equals("SweptSolid")) {
+	//			out.println("SweptSolid");
+				sweptSolidWallInfo(representation, osmSurface);
+			}
+			else if(representation.getRepresentationType().equals("Clipping")) {
+	//			out.println("Clipping");
+				clippingWallInfo(representation, osmSurface);
+			}
+			else if(representation.getRepresentationType().equals("Brep")) {
+	//			out.println("Brep");
+				brepWallInfo(representation, osmSurface);
+			}
+			else {
+				System.out.println("Unknown Body Type");
+			}
+		}
+		else{
+			System.out.println("only processed polyline axis!");
+		}
+	}
+	
+	private void sweptSolidWallInfo(IfcRepresentation representation, OSMSurface osmSurface) {
+		IfcExtrudedAreaSolid ifcExtrudedAreaSolid = (IfcExtrudedAreaSolid)representation.getItems().get(0);
+		double depth = ifcExtrudedAreaSolid.getDepth();
+		
+		//axis
+		for(Point point: currentAxisPoints) {
+			Point wallBoundaryPoint = coordinateSys3DTrans(point);
+			wallBoundaryPoint.setZ(currentStoreyHeight);
+			osmSurface.addPoint(wallBoundaryPoint);
+			allPoints.add(wallBoundaryPoint);
+		}
+		
+		//extruded
+		Collections.reverse(currentAxisPoints);
+		for(Point point: currentAxisPoints) {
+			
+			double currentHeight = 0;
+			if(ifcExtrudedAreaSolid.getExtrudedDirection().getDirectionRatios().get(2).equals(1.0)){
+				currentHeight = currentStoreyHeight + depth;
+			}
+			else{
+				currentHeight = currentStoreyHeight - depth;
+			}
+			point.setZ(currentHeight);
+			Point wallBoundaryPoint = coordinateSys3DTrans(point);
+			wallBoundaryPoint.setZ(currentHeight);
+			osmSurface.addPoint(wallBoundaryPoint);
+			allPoints.add(wallBoundaryPoint);
+		}
+		surfaceList.add(osmSurface);
+	}
+	
+	private void clippingWallInfo(IfcRepresentation representation, OSMSurface osmSurface) {
+		IfcBooleanClippingResult ifcBooleanClippingResult = (IfcBooleanClippingResult)representation.getItems().get(0);
+		while(ifcBooleanClippingResult.getFirstOperand() instanceof IfcBooleanClippingResult){
+			ifcBooleanClippingResult = (IfcBooleanClippingResult) ifcBooleanClippingResult.getFirstOperand();
+		}
+		if(ifcBooleanClippingResult.getFirstOperand() instanceof IfcExtrudedAreaSolid){
+			IfcExtrudedAreaSolid ifcExtrudedAreaSolid = (IfcExtrudedAreaSolid)ifcBooleanClippingResult.getFirstOperand();
+			double depth = ifcExtrudedAreaSolid.getDepth();
+			//axis
+			for(Point point: currentAxisPoints) {
+				Point wallBoundaryPoint = coordinateSys3DTrans(point);
+				wallBoundaryPoint.setZ(currentStoreyHeight);
+				osmSurface.addPoint(wallBoundaryPoint);
+				allPoints.add(wallBoundaryPoint);
+			}
+			
+			//extruded
+			Collections.reverse(currentAxisPoints);
+			for(Point point: currentAxisPoints) {	
+				
+				double currentHeight = 0;
+				if(ifcExtrudedAreaSolid.getExtrudedDirection().getDirectionRatios().get(2).equals(1.0)){
+					currentHeight = currentStoreyHeight + depth;
+				}
+				else{
+					currentHeight = currentStoreyHeight - depth;
+				}
+				point.setZ(currentHeight);
+				Point wallBoundaryPoint = coordinateSys3DTrans(point);
+				wallBoundaryPoint.setZ(currentHeight);
+				osmSurface.addPoint(wallBoundaryPoint);
+				allPoints.add(wallBoundaryPoint);
+			}
+			surfaceList.add(osmSurface);
+		}
+		else{
+			System.out.println("strange clipping shape, not addressed yet!");
+		}
+	}
+	
+	private void brepWallInfo(IfcRepresentation representation, OSMSurface osmSurface) {
+		out.println("brep info!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+	}
+	
+	private void isOutputPathExist() {
+		File file = new File(outputPath);
+		if (!file.exists()) {
+			file.mkdirs();
+		}
+	}
+	
+	private void replaceClosePoints(){
+		Collections.sort(allPoints, new PointSortByXAsc());
+		double temp = allPoints.get(0).getX();
+		for(int i = 1; i < allPoints.size(); i ++){
+			if(allPoints.get(i).getX() - temp <= THRESHOLD){
+				allPoints.get(i).setX(temp);
+			}
+			else{
+				temp = allPoints.get(i).getX();
+			}
+		}
+		
+		Collections.sort(allPoints, new PointSortByYAsc());
+		temp = allPoints.get(0).getY();
+		for(int i = 1; i < allPoints.size(); i ++){
+			if(allPoints.get(i).getY() - temp <= THRESHOLD){
+				allPoints.get(i).setY(temp);
+			}
+			else{
+				temp = allPoints.get(i).getY();
+			}
+		}
+
+		Collections.sort(allPoints, new PointSortByZAsc());
+		temp = allPoints.get(0).getZ();
+		for(int i = 1; i < allPoints.size(); i ++){
+			if(allPoints.get(i).getZ() - temp <= THRESHOLD){
+				allPoints.get(i).setZ(temp);
+			}
+			else{
+				temp = allPoints.get(i).getZ();
+			}
+		}
+	}
+	
+	private void transformUnits(){
+		double scale = 0.3048;
+		for(Point point: allPoints){
+			point.setX(point.x * scale);
+			point.setY(point.y * scale);
+			point.setZ(point.z * scale);
+		}
+	}
+	
+	private void generateOutput(){
+		for(OSMSpace osmSpace: spaceList){
+			outputContent.append("OS:Space,\n  ");
+			outputContent.append(osmSpace.getSpaceName());
+			outputContent.append(",               ! Name\n  ");
+			outputContent.append(osmSpace.getTypeName());
+			outputContent.append(",                         ! Space Type Name\n  ");
+			outputContent.append(osmSpace.getDefaultConstructionSetName());
+			outputContent.append(",                         ! Default Construction Set Name\n  ");
+			outputContent.append(osmSpace.getDefaultScheduleSetName());
+			outputContent.append(",                         ! Default Schedule Set Name\n  ");
+			outputContent.append(osmSpace.getDirectionOfRelativeNorth());
+			outputContent.append(",                         ! Direction of Relative North {deg}\n  ");
+			outputContent.append(osmSpace.getxOrigin());
+			outputContent.append(",                         ! X Origin {m}\n  ");
+			outputContent.append(osmSpace.getyOrigin());
+			outputContent.append(",                         ! Y Origin {m}\n  ");
+			outputContent.append(osmSpace.getzOrigin());
+			outputContent.append(",                         ! Z Origin {m}\n  ");
+			outputContent.append(osmSpace.getBuildingStoreyName());
+			outputContent.append(",                         ! Building Story Name\n  ");
+			outputContent.append(osmSpace.getSpaceName());
+			outputContent.append(" ThermalZone;  ! Thermal Zone Name\n\n");
+		}
+		
+		for(OSMSurface osmSurface: surfaceList){
+			outputContent.append("OS:Surface,\n  ");
+			outputContent.append(osmSurface.getSurfaceName());
+			outputContent.append(",                     ! Name\n  ");
+			outputContent.append(osmSurface.getTypeName());
+			outputContent.append(",                     ! Surface Type\n  ");
+			outputContent.append(osmSurface.getConstructionName());
+			outputContent.append(",                         ! Construction Name\n  ");
+			outputContent.append(osmSurface.getSpaceName());
+			outputContent.append(",             ! Space Name\n  ");
+			outputContent.append(osmSurface.getOutsideBoundaryCondition());
+			outputContent.append(",                 ! Outside Boundary Condition\n  ");
+			outputContent.append(osmSurface.getOutsideBoudaryConditionObject());
+			outputContent.append(",                         ! Outside Boundary Condition Object\n  ");
+			outputContent.append(osmSurface.getSunExposure());
+			outputContent.append(",               ! Sun Exposure\n  ");
+			outputContent.append(osmSurface.getWindExposure());
+			outputContent.append(",              ! Wind Exposure\n  ");
+			outputContent.append(osmSurface.getViewFactorToGround());
+			outputContent.append(",                         ! View Factor to Ground\n  ");
+			outputContent.append(osmSurface.getNumberOfVertices());
+			outputContent.append(",                         ! Number of Vertices\n  ");
+			int size = osmSurface.getPointList().size();
+			for(int i = 0; i < size; i ++){
+				Point point = osmSurface.getPointList().get(i);
+				outputContent.append(point.getX());
+				outputContent.append(",");
+				outputContent.append(point.getY());
+				outputContent.append(",");
+				outputContent.append(point.getZ());
+				if(i < size - 1){
+					outputContent.append(",  ! X,Y,Z Vertex ");
+				}
+				else{
+					outputContent.append(";  ! X,Y,Z Vertex ");
+				}
+				outputContent.append(i+1);
+				outputContent.append(" {m}\n  ");
+			}
+			outputContent.append("\n");
+			
+			List<OSMSubSurface> subSurfaceList = osmSurface.getSubSurfaceList();
+			for(OSMSubSurface osmSubSurface: subSurfaceList){
+				outputContent.append("OS:SubSurface,\n  ");
+				outputContent.append(osmSubSurface.getSubSurfaceName());
+				outputContent.append(",                     ! Name\n  ");
+				outputContent.append(osmSubSurface.getTypeName());
+				outputContent.append(",                     ! Surface Type\n  ");
+				outputContent.append(osmSubSurface.getConstructionName());
+				outputContent.append(",                         ! Construction Name\n  ");
+				outputContent.append(osmSubSurface.getSurfaceName());
+				outputContent.append(",                  ! Surface Name\n  ");
+				outputContent.append(osmSubSurface.getOutsideBoudaryConditionObject());
+				outputContent.append(",                         ! Outside Boundary Condition Object\n  ");
+				outputContent.append(osmSubSurface.getViewFactorToGround());
+				outputContent.append(",                         ! View Factor to Ground\n  ");
+				outputContent.append(osmSubSurface.getShadingControlName());
+				outputContent.append(",                         ! Shading Control Name\n  ");
+				outputContent.append(osmSubSurface.getFrameAndDividerName());
+				outputContent.append(",                         ! Frame and Divider Name\n  ");
+				outputContent.append(osmSubSurface.getMultiplier());
+				outputContent.append(",                         ! Multiplier\n  ");
+				outputContent.append(osmSubSurface.getNumberOfVertices());
+				outputContent.append(",                         ! Number of Vertices\n  ");
+				size = osmSubSurface.getPointList().size();
+				for(int i = 0; i < size; i ++){
+					Point point = osmSubSurface.getPointList().get(i);
+					outputContent.append(point.getX());
+					outputContent.append(",");
+					outputContent.append(point.getY());
+					outputContent.append(",");
+					outputContent.append(point.getZ());
+					if(i < size - 1){
+						outputContent.append(",  ! X,Y,Z Vertex ");
+					}
+					else{
+						outputContent.append(";  ! X,Y,Z Vertex ");
+					}
+					outputContent.append(i+1);
+					outputContent.append(" {m}\n  ");
+				}
+				outputContent.append("\n");
+			}
+		}
+	}
+	
+	private void saveOutputToFile(String modelName){
+		Properties property = System.getProperties();    
+		String osName = property.getProperty("os.name");    
+		System.out.println("operating system is "+osName);
+		if(osName.equalsIgnoreCase("Linux")){
+			outputPath = "/tmp/BIM/OSMs";
+		}
+		else if (osName.startsWith("Windows")) {
+			outputPath = "C:\\tmp\\BIM\\OSMs\\";
+		}
+		
+		FileWriter fstream = null;
+                BufferedWriter bufferWriter = null;
+		try {
+			isOutputPathExist();
+			String fileName = outputPath + modelName +  ".osm";
+			fstream = new FileWriter(fileName);
+			bufferWriter = new BufferedWriter(fstream);
+			bufferWriter.write(outputContent.toString());
+			bufferWriter.close();
+			
+		} catch (Exception e) {
+			e.printStackTrace();
+		} finally {
+			try {
+				bufferWriter.close();
+			} catch (Exception e) {
+				e.printStackTrace();
+			}
+		}
+	}
+	
+	/**
+	 * relPoint: The point to be transformed
+	 * 
+	 * */
+	private Point coordinateSys3DTrans(Point relPoint){
+		IfcProduct ifcProduct = (IfcProduct)currentInstance;
+		IfcLocalPlacement ifcLocalPlacement = (IfcLocalPlacement) ifcProduct.getObjectPlacement();
+		while(ifcLocalPlacement.getPlacementRelTo() != null){
+			relPoint = coordinate3DTrans(relPoint, (IfcAxis2Placement3D)ifcLocalPlacement.getRelativePlacement());
+			ifcLocalPlacement = (IfcLocalPlacement) ifcLocalPlacement.getPlacementRelTo();
+		}
+		return coordinate3DTrans(relPoint, (IfcAxis2Placement3D)ifcLocalPlacement.getRelativePlacement());
+	}
+	
+	/**
+	 * relPoint: The point to be transformed
+	 * ifcRelativePlacement: relative offset
+	 * if xDirection is empty, assign it to default value
+	 * relOrigin: the relative coordinate system's origin point
+	 * absPoint: the transformed point
+	 * */
+	private Point coordinate3DTrans(Point relPoint, IfcAxis2Placement3D ifcRelativePlacement){
+		Point absPoint = new Point();
+		
+		List<Double> relOrigin = ifcRelativePlacement.getLocation().getCoordinates();	//new origin point
+		
+		List<Double> xDirection = new ArrayList<Double>();				// new x Axis
+		if(ifcRelativePlacement.getRefDirection() == null){
+			xDirection.add(1.0);
+			xDirection.add(0.0);
+			xDirection.add(0.0);
+		}
+		else{
+			xDirection = ifcRelativePlacement.getRefDirection().getDirectionRatios();
+		}
+		List<Double> zDirection = new ArrayList<Double>();			//new z Axis
+		if(ifcRelativePlacement.getAxis() == null){
+			zDirection.add(0.0);
+			zDirection.add(0.0);
+			zDirection.add(1.0);
+		}
+		else{
+			zDirection = ifcRelativePlacement.getAxis().getDirectionRatios();
+		}
+		
+		Double ox = relOrigin.get(0);
+		Double oy = relOrigin.get(1);
+		Double oz = relOrigin.get(2);
+		
+		/**according to x axis and z axis, get y axis: ryx, ryy, ryz
+		 * rxx, rxy, rxz, ryx, ryy, ryz, rzx, rzy, rzz refer to the relative coordinate system in scale 1
+		 * */
+		double rxLength = Math.sqrt(Math.pow(xDirection.get(0), 2) + Math.pow(xDirection.get(1), 2) + Math.pow(xDirection.get(2), 2));
+		double rxx = xDirection.get(0) / rxLength;
+		double rxy = xDirection.get(1) / rxLength;
+		double rxz = xDirection.get(2) / rxLength;
+		
+		double rzLength = Math.sqrt(Math.pow(zDirection.get(0), 2) + Math.pow(zDirection.get(1), 2) + Math.pow(zDirection.get(2), 2));
+		double rzx = zDirection.get(0) / rzLength;
+		double rzy = zDirection.get(1) / rzLength;
+		double rzz = zDirection.get(2) / rzLength;
+		
+		double ryx = 0.0;
+		double ryy = 0.0;
+		double ryz = 0.0;
+		if(rxz*rzy == rxy*rzz){
+			ryx = -rxy;
+			ryy = rxx;
+			rxz = ryz = 0.0;
+		}else{
+			ryx = 1.0;
+			ryy = (rxx*rzz - rzx*rxz)/(rzy*rxz - rxy*rzz);
+			ryz = (rxx*rzy - rzx*rxy)/(rxy*rzz - rxz*rzy);
+		}
+		double ryLength = Math.sqrt(Math.pow(ryx, 2) + Math.pow(ryy, 2) + Math.pow(ryz, 2));
+		
+		Double a1 = relPoint.getX();
+		Double a2 = relPoint.getY();
+		Double a3 = relPoint.getZ();
+
+		Double x = a1 * rxx/rxLength + a2 * ryx/ryLength + a3 * rzx/rzLength + ox;
+		absPoint.setX(x);
+		
+		Double y = a1 * rxy/rxLength + a2 * ryy/ryLength + a3 * rzy/rzLength + oy;
+		absPoint.setY(y);
+		
+		Double z = a1 * rxz/rxLength + a2 * ryz/ryLength + a3 * rzz/rzLength + oz;
+		absPoint.setZ(z);
+		
+		return absPoint;
+	}
+
+	class Point{
+		private Double x;
+		private Double y;
+		private Double z;
+		public Point() { }
+		public Point(Double x, Double y) {
+			this.x = x;
+			this.y = y;
+		}
+		public Point(Double x, Double y, Double z) {
+			this.x = x;
+			this.y = y;
+			this.z = z;
+		}
+		public Point(Point p) {
+			this.x = p.getX();
+			this.y = p.getY();
+			this.z = p.getZ();
+		}
+		public Double getX() {
+			return x;
+		}
+		public void setX(Double x) {
+			this.x = x;
+		}
+		public Double getY() {
+			return y;
+		}
+		public void setY(Double y) {
+			this.y = y;
+		}
+		public Double getZ() {
+			return z;
+		}
+		public void setZ(Double z) {
+			this.z = z;
+		}
+		public String toString(){
+			return "(" + x + ", " + y + ", " + z + ")";
+		}
+		public boolean equals(Point p){
+			if(this.x == p.x && this.y == p.y && this.z == p.z)
+				return true;
+			return false;
+		}
+		public void addWith(Point p){
+			this.x += p.x;
+			this.y += p.y;
+			this.z += p.z;
+		}
+	}
+
+	class OSMSurface{
+		private String surfaceName = "";
+		private String typeName = "";
+		private String constructionName = "";
+		private String spaceName = "";
+		private String outsideBoundaryCondition = "";
+		private String outsideBoudaryConditionObject = "";
+		private String sunExposure = "";
+		private String windExposure = "";
+		private String viewFactorToGround = "";
+		private String numberOfVertices = "";
+		private List<Point> pointList = new ArrayList<Point>();
+		private List<OSMSubSurface> subSurfaceList = new ArrayList<OSMSubSurface>();
+		public String getSurfaceName() {
+			return surfaceName;
+		}
+		public void setSurfaceName(String surfaceName) {
+			this.surfaceName = surfaceName;
+		}
+		public String getTypeName() {
+			return typeName;
+		}
+		public void setTypeName(String typeName) {
+			this.typeName = typeName;
+		}
+		public String getConstructionName() {
+			return constructionName;
+		}
+		public void setConstructionName(String constructionName) {
+			this.constructionName = constructionName;
+		}
+		public String getSpaceName() {
+			return spaceName;
+		}
+		public void setSpaceName(String spaceName) {
+			this.spaceName = spaceName;
+		}
+		public String getOutsideBoundaryCondition() {
+			return outsideBoundaryCondition;
+		}
+		public void setOutsideBoundaryCondition(String outsideBoundaryCondition) {
+			this.outsideBoundaryCondition = outsideBoundaryCondition;
+		}
+		public String getOutsideBoudaryConditionObject() {
+			return outsideBoudaryConditionObject;
+		}
+		public void setOutsideBoudaryConditionObject(
+				String outsideBoudaryConditionObject) {
+			this.outsideBoudaryConditionObject = outsideBoudaryConditionObject;
+		}
+		public String getSunExposure() {
+			return sunExposure;
+		}
+		public void setSunExposure(String sunExposure) {
+			this.sunExposure = sunExposure;
+		}
+		public String getWindExposure() {
+			return windExposure;
+		}
+		public void setWindExposure(String windExposure) {
+			this.windExposure = windExposure;
+		}
+		public String getViewFactorToGround() {
+			return viewFactorToGround;
+		}
+		public void setViewFactorToGround(String viewFactorToGround) {
+			this.viewFactorToGround = viewFactorToGround;
+		}
+		public String getNumberOfVertices() {
+			return numberOfVertices;
+		}
+		public void setNumberOfVertices(String numberOfVertices) {
+			this.numberOfVertices = numberOfVertices;
+		}
+		public List<Point> getPointList() {
+			return pointList;
+		}
+		public void addPoint(Point point) {
+			this.pointList.add(point);
+		}
+		public List<OSMSubSurface> getSubSurfaceList() {
+			return subSurfaceList;
+		}
+		public void addSubSurface(OSMSubSurface subSurface) {
+			this.subSurfaceList.add(subSurface);
+		}
+	}
+
+	class OSMSubSurface{
+		private String subSurfaceName = "";
+		private String typeName = "";
+		private String constructionName = "";
+		private String surfaceName = "";
+		private String outsideBoudaryConditionObject = "";
+		private String viewFactorToGround = "";
+		private String shadingControlName = "";
+		private String frameAndDividerName = "";
+		private String multiplier = "";
+		private String numberOfVertices = "";
+		private List<Point> pointList = new ArrayList<Point>();
+		public String getSubSurfaceName() {
+			return subSurfaceName;
+		}
+		public void setSubSurfaceName(String subSurfaceName) {
+			this.subSurfaceName = subSurfaceName;
+		}
+		public String getTypeName() {
+			return typeName;
+		}
+		public void setTypeName(String typeName) {
+			this.typeName = typeName;
+		}
+		public String getConstructionName() {
+			return constructionName;
+		}
+		public void setConstructionName(String constructionName) {
+			this.constructionName = constructionName;
+		}
+		public String getSurfaceName() {
+			return surfaceName;
+		}
+		public void setSurfaceName(String surfaceName) {
+			this.surfaceName = surfaceName;
+		}
+		public String getOutsideBoudaryConditionObject() {
+			return outsideBoudaryConditionObject;
+		}
+		public void setOutsideBoudaryConditionObject(
+				String outsideBoudaryConditionObject) {
+			this.outsideBoudaryConditionObject = outsideBoudaryConditionObject;
+		}
+		public String getViewFactorToGround() {
+			return viewFactorToGround;
+		}
+		public void setViewFactorToGround(String viewFactorToGround) {
+			this.viewFactorToGround = viewFactorToGround;
+		}
+		public String getShadingControlName() {
+			return shadingControlName;
+		}
+		public void setShadingControlName(String shadingControlName) {
+			this.shadingControlName = shadingControlName;
+		}
+		public String getFrameAndDividerName() {
+			return frameAndDividerName;
+		}
+		public void setFrameAndDividerName(String frameAndDividerName) {
+			this.frameAndDividerName = frameAndDividerName;
+		}
+		public String getMultiplier() {
+			return multiplier;
+		}
+		public void setMultiplier(String multiplier) {
+			this.multiplier = multiplier;
+		}
+		public String getNumberOfVertices() {
+			return numberOfVertices;
+		}
+		public void setNumberOfVertices(String numberOfVertices) {
+			this.numberOfVertices = numberOfVertices;
+		}
+		public List<Point> getPointList() {
+			return pointList;
+		}
+		public void addPoint(Point point) {
+			this.pointList.add(point);
+		}
+	}
+	
+	class OSMSpace{
+		private String spaceName = "";
+		private String typeName = "";
+		private String defaultConstructionSetName = "";
+		private String defaultScheduleSetName = "";
+		private String directionOfRelativeNorth = "";
+		private String xOrigin = "";
+		private String yOrigin = "";
+		private String zOrigin = "";
+		private String buildingStoreyName = "";
+		private String thermalZoneName = "";
+		public String getSpaceName() {
+			return spaceName;
+		}
+		public void setSpaceName(String spaceName) {
+			this.spaceName = spaceName;
+		}
+		public String getTypeName() {
+			return typeName;
+		}
+		public void setTypeName(String typeName) {
+			this.typeName = typeName;
+		}
+		public String getDefaultConstructionSetName() {
+			return defaultConstructionSetName;
+		}
+		public void setDefaultConstructionSetName(String defaultConstructionSetName) {
+			this.defaultConstructionSetName = defaultConstructionSetName;
+		}
+		public String getDefaultScheduleSetName() {
+			return defaultScheduleSetName;
+		}
+		public void setDefaultScheduleSetName(String defaultScheduleSetName) {
+			this.defaultScheduleSetName = defaultScheduleSetName;
+		}
+		public String getDirectionOfRelativeNorth() {
+			return directionOfRelativeNorth;
+		}
+		public void setDirectionOfRelativeNorth(String directionOfRelativeNorth) {
+			this.directionOfRelativeNorth = directionOfRelativeNorth;
+		}
+		public String getxOrigin() {
+			return xOrigin;
+		}
+		public void setxOrigin(String xOrigin) {
+			this.xOrigin = xOrigin;
+		}
+		public String getyOrigin() {
+			return yOrigin;
+		}
+		public void setyOrigin(String yOrigin) {
+			this.yOrigin = yOrigin;
+		}
+		public String getzOrigin() {
+			return zOrigin;
+		}
+		public void setzOrigin(String zOrigin) {
+			this.zOrigin = zOrigin;
+		}
+		public String getBuildingStoreyName() {
+			return buildingStoreyName;
+		}
+		public void setBuildingStoreyName(String buildingStoreyName) {
+			this.buildingStoreyName = buildingStoreyName;
+		}
+		public String getThermalZoneName() {
+			return thermalZoneName;
+		}
+		public void setThermalZoneName(String thermalZoneName) {
+			this.thermalZoneName = thermalZoneName;
+		}
+	}
+
+	class PointSortByXAsc implements Comparator<Point>{
+
+		@Override
+		public int compare(Point o1, Point o2) {
+			return o1.getX().compareTo(o2.getX());
+		}
+	}
+	
+	class PointSortByYAsc implements Comparator<Point>{
+
+		@Override
+		public int compare(Point o1, Point o2) {
+			return o1.getY().compareTo(o2.getY());
+		}
+	}
+	
+	class PointSortByZAsc implements Comparator<Point>{
+
+		@Override
+		public int compare(Point o1, Point o2) {
+			return o1.getZ().compareTo(o2.getZ());
+		}
+	}
+}

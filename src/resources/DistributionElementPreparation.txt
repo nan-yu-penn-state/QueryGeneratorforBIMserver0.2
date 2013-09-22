@@ -1,0 +1,14 @@
+package org.bimserver.querycompiler;
+
+import java.io.PrintWriter;
+import org.bimserver.plugins.serializers.IfcModelInterface;
+import java.util.*;
+import org.bimserver.models.ifc2x3tc1.*;
+
+public class Query implements QueryInterface {
+
+    private IfcModelInterface model;
+    private PrintWriter out;
+
+    @Override
+    public void query(IfcModelInterface model, PrintWriter out) {

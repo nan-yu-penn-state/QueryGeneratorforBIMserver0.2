@@ -1,0 +1,45 @@
+                            for (IfcRelDefines ifc_rel_defines : list_defines) {
+                                if (ifc_rel_defines instanceof IfcRelDefinesByProperties) {
+                                    IfcRelDefinesByProperties ifc_rel_defines_by_property = (IfcRelDefinesByProperties) ifc_rel_defines;
+                                    IfcPropertySetDefinition ifc_property_set_definition = ifc_rel_defines_by_property.getRelatingPropertyDefinition();
+                                    if (ifc_property_set_definition instanceof IfcElementQuantity) {
+                                        List<IfcPhysicalQuantity> list_of_quantity = ((IfcElementQuantity) ifc_property_set_definition).getQuantities();
+                                        for (IfcPhysicalQuantity ifc_physical_quantity : list_of_quantity) {
+                                            if (ifc_physical_quantity instanceof IfcQuantityLength) {
+                                                //IfcQuantityLength length=(Ifc)
+                                                IfcQuantityLength length = (IfcQuantityLength) ifc_physical_quantity;
+                                                //out.println((IfcQuantityLength));
+                                                out.println(length.getName() + " " + length.getLengthValue());
+                                            }
+                                            if (ifc_physical_quantity instanceof IfcQuantityArea) {
+                                                IfcQuantityArea area = (IfcQuantityArea) ifc_physical_quantity;
+                                                out.println(area.getName() + " " + area.getAreaValue());
+                                            }
+
+                                            if (ifc_physical_quantity instanceof IfcQuantityVolume) {
+                                                IfcQuantityVolume volume = (IfcQuantityVolume) ifc_physical_quantity;
+                                                out.println(volume.getName() + " " + volume.getVolumeValue());
+                                            }
+                                            if (ifc_physical_quantity instanceof IfcQuantityCount) {
+                                                IfcQuantityCount count = (IfcQuantityCount) ifc_physical_quantity;
+                                                out.println(count.getName() + " " + count.getCountValue());
+                                            }
+                                            if (ifc_physical_quantity instanceof IfcQuantityWeight) {
+                                                IfcQuantityWeight weight = (IfcQuantityWeight) ifc_physical_quantity;
+                                                out.println(weight.getName() + " " + weight.getWeightValue());
+                                            }
+                                            if (ifc_physical_quantity instanceof IfcQuantityTime) {
+                                                IfcQuantityTime time = (IfcQuantityTime) ifc_physical_quantity;
+                                                out.println(time.getName() + " " + time.getTimeValue());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
