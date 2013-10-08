@@ -21,7 +21,7 @@ public class Query implements QueryInterface {
 	private List<Point> allPoints = new ArrayList<Point>();			//all points in order to replace close ones
 	private List<OSMSpace> spaceList = new ArrayList<OSMSpace>();	//all spaces
 	private List<OSMSurface> surfaceList = new ArrayList<OSMSurface>();	//all surfaces: walls, roofceilings, floors
-	private final static Double THRESHOLD = 2.0;		// gap threshold
+	private final static Double THRESHOLD = 0.5;		// gap threshold
 	
 	@Override
 	public void query(IfcModelInterface model, PrintWriter out) {
@@ -52,8 +52,8 @@ public class Query implements QueryInterface {
 				}
 			}
 		}
-		replaceClosePoints();
 		transformUnits();
+		replaceClosePoints();
 		generateOutput();
 		saveOutputToFile(model.getName());
 	}
