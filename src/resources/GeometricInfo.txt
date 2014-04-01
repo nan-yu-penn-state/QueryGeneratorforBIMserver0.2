@@ -4,8 +4,11 @@ import java.io.BufferedWriter;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.PrintWriter;
+
 import org.bimserver.plugins.serializers.IfcModelInterface;
+
 import java.util.*;
+
 import org.bimserver.models.ifc2x3tc1.*;
 
 public class Query implements QueryInterface {
@@ -18,10 +21,10 @@ public class Query implements QueryInterface {
 	private IfcObject currentInstance; 		//current instance
 	private Map<String, String> spaceNameMap = new HashMap<String, String>();		//space name map for OpenStudio. 
 								//key is the space name from IFC, value is the space name for OSM
-	private List<Point> allPoints = new ArrayList<Point>();			//all points in order to replace close ones
+	private List<Point> allPoints = new ArrayList<Point>();		//all surface/subsurface points in order to replace close ones and transform the units
 	private List<OSMSpace> spaceList = new ArrayList<OSMSpace>();	//all spaces
 	private List<OSMSurface> surfaceList = new ArrayList<OSMSurface>();	//all surfaces: walls, roofceilings, floors
-	private final static Double THRESHOLD = 0.5;		// gap threshold
+	private final static Double THRESHOLD = 0.6;		// gap threshold
 	
 	@Override
 	public void query(IfcModelInterface model, PrintWriter out) {
@@ -47,6 +50,12 @@ public class Query implements QueryInterface {
 					for (IfcProduct product : rel.getRelatedElements()) {
 						if (product instanceof IfcWall) {
 							this.wallGeometryInfo(product);
+						}
+						else if(product instanceof IfcSlab){
+							this.slabGeometryInfo(product);
+						}
+						else if(product instanceof IfcRoof){
+							this.roofGeometryInfo(product);
 						}
 					}
 				}
@@ -76,15 +85,66 @@ public class Query implements QueryInterface {
 				surfaceName = "su-" + (surfaceList.size() + 1);
 				osmSurface.setSurfaceName(surfaceName);
 				osmSurface.setTypeName("Wall");
-				osmSurface.setSpaceName("sp-111-Space");
-				osmSurface.setOutsideBoundaryCondition("Outdoors");
-				osmSurface.setSunExposure("SunExposed");
-				osmSurface.setWindExposure("WindExposed");
+				osmSurface.setSpaceName("sp-111-Space");		//TODO: to be replaced by real value
 				
+				System.out.println("wall name is " + currentInstance.getName());
+				for(int j = 0; j < ifcWallinstance.getIsDefinedBy().size(); j ++){
+					IfcRelDefinesByProperties ifcRelDefinesByProperties = (IfcRelDefinesByProperties) ifcWallinstance.getIsDefinedBy().get(j);
+					if(ifcRelDefinesByProperties.getRelatingPropertyDefinition().getName().equals("Pset_WallCommon")){
+						List<IfcProperty> ifcPropertySetList = ((IfcPropertySet)ifcRelDefinesByProperties.getRelatingPropertyDefinition()).getHasProperties();
+						for(int k = 0; k < ifcPropertySetList.size(); k ++){
+							IfcPropertySingleValue ifcPropertySingleValue = (IfcPropertySingleValue)ifcPropertySetList.get(k);
+							if(ifcPropertySingleValue.getName().equals("IsExternal")){
+								Tristate isExternal = ((IfcBoolean)ifcPropertySingleValue.getNominalValue()).getWrappedValue();
+								if(isExternal.getValue() == 0){		//true
+									osmSurface.setOutsideBoundaryCondition("Outdoors");
+									osmSurface.setSunExposure("SunExposed");
+									osmSurface.setWindExposure("WindExposed");
+								}
+								else if(isExternal.getValue() == 1){	//false
+									osmSurface.setOutsideBoundaryCondition("Surface");
+									osmSurface.setSunExposure("NoSun");
+									osmSurface.setWindExposure("NoWind");
+
+								}
+								else{
+									System.out.println("invalid value of isExternal!!");
+								}
+								break;
+							}
+						}
+						break;
+					}
+				}
 				wallBodyInfo(representation, osmSurface);
 			}
 			else
 				System.out.println("    Unknown representation type");
+		}
+		
+		//extract sub surface: windows, doors
+		List<IfcRelVoidsElement> ifcRelVoidsElementList = ifcWallinstance.getHasOpenings();
+		for(IfcRelVoidsElement ifcRelVoidsElement : ifcRelVoidsElementList){
+			IfcOpeningElement ifcOpeningElement = (IfcOpeningElement) ifcRelVoidsElement.getRelatedOpeningElement();
+			if(ifcOpeningElement.getHasFillings().size() > 0){
+				IfcRelFillsElement ifcRelFillsElement = ifcOpeningElement.getHasFillings().get(0);
+				IfcElement ifcElement = ifcRelFillsElement.getRelatedBuildingElement();	//windows or doors
+				currentInstance = ifcElement;
+				OSMSubSurface osmSubSurface = new OSMSubSurface();
+				osmSubSurface.setSubSurfaceName(ifcElement.getName());
+				osmSubSurface.setSurfaceName(surfaceName);
+				if(ifcElement instanceof IfcWindow){
+					osmSubSurface.setTypeName("FixedWindow");
+				}
+				else if(ifcElement instanceof IfcDoor){
+					osmSubSurface.setTypeName("Door");
+				}
+				else{
+					osmSubSurface.setTypeName("Unknown");
+					System.out.println("unknow type!!");
+				}
+				this.subSurfaceGeometryInfo(ifcOpeningElement, osmSurface, osmSubSurface);
+			}
 		}
 	}
 	
@@ -140,6 +200,13 @@ public class Query implements QueryInterface {
 	private void sweptSolidWallInfo(IfcRepresentation representation, OSMSurface osmSurface) {
 		IfcExtrudedAreaSolid ifcExtrudedAreaSolid = (IfcExtrudedAreaSolid)representation.getItems().get(0);
 		double depth = ifcExtrudedAreaSolid.getDepth();
+		double currentHeight = 0;
+		if(ifcExtrudedAreaSolid.getExtrudedDirection().getDirectionRatios().get(2).equals(1.0)){
+			currentHeight = currentStoreyHeight + depth;
+		}
+		else{
+			currentHeight = currentStoreyHeight - depth;
+		}
 		
 		//axis
 		for(Point point: currentAxisPoints) {
@@ -152,14 +219,6 @@ public class Query implements QueryInterface {
 		//extruded
 		Collections.reverse(currentAxisPoints);
 		for(Point point: currentAxisPoints) {
-			
-			double currentHeight = 0;
-			if(ifcExtrudedAreaSolid.getExtrudedDirection().getDirectionRatios().get(2).equals(1.0)){
-				currentHeight = currentStoreyHeight + depth;
-			}
-			else{
-				currentHeight = currentStoreyHeight - depth;
-			}
 			point.setZ(currentHeight);
 			Point wallBoundaryPoint = coordinateSys3DTrans(point);
 			wallBoundaryPoint.setZ(currentHeight);
@@ -177,6 +236,14 @@ public class Query implements QueryInterface {
 		if(ifcBooleanClippingResult.getFirstOperand() instanceof IfcExtrudedAreaSolid){
 			IfcExtrudedAreaSolid ifcExtrudedAreaSolid = (IfcExtrudedAreaSolid)ifcBooleanClippingResult.getFirstOperand();
 			double depth = ifcExtrudedAreaSolid.getDepth();
+			double currentHeight = 0;
+			if(ifcExtrudedAreaSolid.getExtrudedDirection().getDirectionRatios().get(2).equals(1.0)){
+				currentHeight = currentStoreyHeight + depth;
+			}
+			else{
+				currentHeight = currentStoreyHeight - depth;
+			}
+			
 			//axis
 			for(Point point: currentAxisPoints) {
 				Point wallBoundaryPoint = coordinateSys3DTrans(point);
@@ -188,14 +255,6 @@ public class Query implements QueryInterface {
 			//extruded
 			Collections.reverse(currentAxisPoints);
 			for(Point point: currentAxisPoints) {	
-				
-				double currentHeight = 0;
-				if(ifcExtrudedAreaSolid.getExtrudedDirection().getDirectionRatios().get(2).equals(1.0)){
-					currentHeight = currentStoreyHeight + depth;
-				}
-				else{
-					currentHeight = currentStoreyHeight - depth;
-				}
 				point.setZ(currentHeight);
 				Point wallBoundaryPoint = coordinateSys3DTrans(point);
 				wallBoundaryPoint.setZ(currentHeight);
@@ -211,6 +270,184 @@ public class Query implements QueryInterface {
 	
 	private void brepWallInfo(IfcRepresentation representation, OSMSurface osmSurface) {
 		out.println("brep info!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+	}
+	
+	private List<Point> rectangleGeometryInfo(IfcExtrudedAreaSolid ifcExtrudedAreaSolid){
+		IfcRectangleProfileDef sweptArea = (IfcRectangleProfileDef) ifcExtrudedAreaSolid.getSweptArea();
+		IfcAxis2Placement3D position = (IfcAxis2Placement3D) ifcExtrudedAreaSolid.getPosition();
+		
+		/**internal 2D swept area coordinate transformation*/
+		//step 1: 2D coordinate system transformation
+		List<Double> originPointIn2DSwpetArea = sweptArea.getPosition().getLocation().getCoordinates();
+		IfcDirection xDirectionIn2DSwpetArea = sweptArea.getPosition().getRefDirection();
+		double rxx = xDirectionIn2DSwpetArea.getDirectionRatios().get(0);
+		double rxy = xDirectionIn2DSwpetArea.getDirectionRatios().get(1);
+		double rxLength = Math.sqrt(Math.pow(rxx, 2) + Math.pow(rxy, 2));
+		double width = sweptArea.getXDim();
+		double height = sweptArea.getYDim(); 
+		double newWidth = width;
+		double newHeight = height;
+		if(rxy != 0){
+			double ryx = 1.0;
+			double ryy = -rxx / rxy;
+			double ryLength = Math.sqrt(Math.pow(ryx, 2) + Math.pow(ryy, 2));
+			newWidth = Math.abs(width * rxx / rxLength + height * ryx / ryLength);
+			newHeight = Math.abs(width * rxy / rxLength + height * ryy / ryLength);
+		}
+		
+		List<Point> pointList = new ArrayList<Point>();
+		//step 2: add the offset of 2D origin point
+		pointList.add(new Point(originPointIn2DSwpetArea.get(0) - newWidth / 2, originPointIn2DSwpetArea.get(1) - newHeight / 2, currentStoreyHeight));
+		pointList.add(new Point(originPointIn2DSwpetArea.get(0) - newWidth / 2, originPointIn2DSwpetArea.get(1) + newHeight / 2, currentStoreyHeight));
+		pointList.add(new Point(originPointIn2DSwpetArea.get(0) + newWidth / 2, originPointIn2DSwpetArea.get(1) + newHeight / 2, currentStoreyHeight));
+		pointList.add(new Point(originPointIn2DSwpetArea.get(0) + newWidth / 2, originPointIn2DSwpetArea.get(1) - newHeight / 2, currentStoreyHeight));
+		
+		List<Point> returnPoints = new ArrayList<Point>();
+		for(Point point : pointList){
+			point = coordinate3DTrans(point, position);	//step 3: 3D coordinate system transformation
+			point = coordinateSys3DTrans(point);		//Final step: common transformation
+			returnPoints.add(point);
+		}
+		return returnPoints;
+	}
+	
+	private List<Point> arbitraryClosedGeometryInfo(IfcExtrudedAreaSolid ifcExtrudedAreaSolid){
+		IfcArbitraryClosedProfileDef sweptArea = (IfcArbitraryClosedProfileDef) ifcExtrudedAreaSolid.getSweptArea();
+		IfcAxis2Placement3D position = (IfcAxis2Placement3D) ifcExtrudedAreaSolid.getPosition();
+		
+		//step 1: extract all local 2D points
+		IfcPolyline ifcPolyline = (IfcPolyline) sweptArea.getOuterCurve();
+		List<IfcCartesianPoint> cartesianPointList = ifcPolyline.getPoints();
+		List<Point> pointList = new ArrayList<Point>();
+		for(IfcCartesianPoint cartesianPoint : cartesianPointList){
+			pointList.add(new Point(cartesianPoint.getCoordinates().get(0), cartesianPoint.getCoordinates().get(1), currentStoreyHeight));
+		}
+
+		System.out.println("current instance is " + currentInstance.getName());
+		List<Point> returnPoints = new ArrayList<Point>();
+		// for each point, do step 2 to step 3
+		for(Point point : pointList){
+			point = coordinate3DTrans(point, position);	//step 2: 3D coordinate system transformation
+			point = coordinateSys3DTrans(point);		//step 3: common transformation
+			returnPoints.add(point);
+		}
+		return returnPoints;
+	}
+	
+	/** ifcElement is ifcOpeningElement*/
+	private void subSurfaceGeometryInfo(IfcElement ifcElement, OSMSurface osmSurface, OSMSubSurface osmSubSurface){
+		List<IfcRepresentation> representations = ifcElement.getRepresentation().getRepresentations();
+		for(IfcRepresentation representation: representations) {
+			if(representation.getRepresentationIdentifier().equals("Body") && representation.getRepresentationType().equals("SweptSolid")){
+				IfcExtrudedAreaSolid ifcExtrudedAreaSolid = (IfcExtrudedAreaSolid)representation.getItems().get(0);
+				if(ifcExtrudedAreaSolid.getSweptArea() instanceof IfcRectangleProfileDef){
+					List<Point> boundaryPoints = rectangleGeometryInfo(ifcExtrudedAreaSolid);
+					for(Point point : boundaryPoints){
+						osmSubSurface.addPoint(point);
+						allPoints.add(point);
+					}
+					osmSurface.addSubSurface(osmSubSurface);
+				}
+				else{
+					System.out.println("body is not in rectangle");
+				}
+			}
+			else
+				System.out.println("    Unknown representation type");
+		}
+	}
+	
+	private void roofBodyInfo(IfcRepresentation representation, OSMSurface osmSurface) {
+		//TODO
+	}
+	
+	private void slabBodyInfo(IfcRepresentation representation, OSMSurface osmSurface) {
+		if(representation.getRepresentationType().equals("SweptSolid")) {
+			IfcExtrudedAreaSolid ifcExtrudedAreaSolid = (IfcExtrudedAreaSolid)representation.getItems().get(0);
+			if(ifcExtrudedAreaSolid.getSweptArea() instanceof IfcRectangleProfileDef){
+				List<Point> boundaryPoints = rectangleGeometryInfo(ifcExtrudedAreaSolid);
+				for(Point point : boundaryPoints){
+					point.setZ(currentStoreyHeight);			//Reset height
+					osmSurface.addPoint(point);
+					allPoints.add(point);
+				}
+				surfaceList.add(osmSurface);
+			}
+			else if(ifcExtrudedAreaSolid.getSweptArea() instanceof IfcArbitraryClosedProfileDef){
+				List<Point> boundaryPoints = arbitraryClosedGeometryInfo(ifcExtrudedAreaSolid);
+				for(Point point : boundaryPoints){
+					point.setZ(currentStoreyHeight);			//Reset height
+					osmSurface.addPoint(point);
+					allPoints.add(point);
+				}
+				surfaceList.add(osmSurface);
+			}
+			else{
+				System.out.println("slab is not in rectangle or arbitrary closed profile");
+			}
+		}
+		else{
+			System.out.println("unknown slab type");
+		}
+	}
+	
+	private void roofGeometryInfo(IfcProduct product) {
+		IfcRoof ifcRoof = (IfcRoof) product;
+		currentInstance = ifcRoof;
+		List<IfcRelSpaceBoundary> ifcRelSpaceBoundaryList = ifcRoof.getProvidesBoundaries();
+		
+		OSMSurface osmSurface = new OSMSurface();
+		osmSurface.setSurfaceName("su-" + (surfaceList.size() + 1));
+		osmSurface.setTypeName("RoofCeiling");
+		osmSurface.setSpaceName("sp-111-Space");	//TODO: to be replaced by real value
+		osmSurface.setOutsideBoundaryCondition("Surface");
+		osmSurface.setSunExposure("NoSun");
+		osmSurface.setWindExposure("NoWind");
+		
+		
+		if(ifcRoof.getRepresentation() != null){
+			List<IfcRepresentation> representations = ifcRoof.getRepresentation().getRepresentations();
+			for(IfcRepresentation representation: representations) {
+				if(representation.getRepresentationIdentifier().equals("Body")){
+					roofBodyInfo(representation, osmSurface);
+				}
+				else
+					System.out.println("    Unknown representation type");
+			}
+		}
+	}
+	
+	private void slabGeometryInfo(IfcProduct product) {
+		IfcSlab ifcSlab = (IfcSlab) product;
+		currentInstance = ifcSlab;
+		OSMSurface osmSurface = new OSMSurface();
+		osmSurface.setSurfaceName("su-" + (surfaceList.size() + 1));
+		osmSurface.setSpaceName("sp-111-Space");		//TODO: to be replaced by real value
+		osmSurface.setOutsideBoundaryCondition("Ground");
+		osmSurface.setSunExposure("NoSun");
+		osmSurface.setWindExposure("NoWind");
+		
+		if(ifcSlab.getPredefinedType().getName().equals("FLOOR")){
+			osmSurface.setTypeName("Floor");
+		}
+		else if(ifcSlab.getPredefinedType().getName().equals("ROOF")){
+			osmSurface.setTypeName("RoofCeiling");
+		}
+		else{
+			System.out.println("Error: Unknown slab type!");
+		}
+		
+		System.out.println("slab name is " + ifcSlab.getName() + ", surface number is " + osmSurface.getSurfaceName());
+		
+		List<IfcRelSpaceBoundary> ifcRelSpaceBoundaryList = ifcSlab.getProvidesBoundaries();
+		List<IfcRepresentation> representations = ifcSlab.getRepresentation().getRepresentations();
+		for(IfcRepresentation representation: representations) {
+			if(representation.getRepresentationIdentifier().equals("Body")){
+				slabBodyInfo(representation, osmSurface);
+			}
+			else
+				System.out.println("    Unknown representation type");
+		}
 	}
 	
 	private void isOutputPathExist() {
@@ -459,29 +696,21 @@ public class Query implements QueryInterface {
 		/**according to x axis and z axis, get y axis: ryx, ryy, ryz
 		 * rxx, rxy, rxz, ryx, ryy, ryz, rzx, rzy, rzz refer to the relative coordinate system in scale 1
 		 * */
-		double rxLength = Math.sqrt(Math.pow(xDirection.get(0), 2) + Math.pow(xDirection.get(1), 2) + Math.pow(xDirection.get(2), 2));
-		double rxx = xDirection.get(0) / rxLength;
-		double rxy = xDirection.get(1) / rxLength;
-		double rxz = xDirection.get(2) / rxLength;
+		double rxx = xDirection.get(0);
+		double rxy = xDirection.get(1);
+		double rxz = xDirection.get(2);
 		
-		double rzLength = Math.sqrt(Math.pow(zDirection.get(0), 2) + Math.pow(zDirection.get(1), 2) + Math.pow(zDirection.get(2), 2));
-		double rzx = zDirection.get(0) / rzLength;
-		double rzy = zDirection.get(1) / rzLength;
-		double rzz = zDirection.get(2) / rzLength;
+		double rzx = zDirection.get(0);
+		double rzy = zDirection.get(1);
+		double rzz = zDirection.get(2);
 		
-		double ryx = 0.0;
-		double ryy = 0.0;
-		double ryz = 0.0;
-		if(rxz*rzy == rxy*rzz){
-			ryx = -rxy;
-			ryy = rxx;
-			rxz = ryz = 0.0;
-		}else{
-			ryx = 1.0;
-			ryy = (rxx*rzz - rzx*rxz)/(rzy*rxz - rxy*rzz);
-			ryz = (rxx*rzy - rzx*rxy)/(rxy*rzz - rxz*rzy);
-		}
+		double ryx = rxz*rzy - rxy*rzz;
+		double ryy = rxx*rzz - rxz*rzx;
+		double ryz = rxy*rzx - rxx*rzy;
+		double rxLength = Math.sqrt(Math.pow(rxx, 2) + Math.pow(rxy, 2) + Math.pow(rxz, 2));
 		double ryLength = Math.sqrt(Math.pow(ryx, 2) + Math.pow(ryy, 2) + Math.pow(ryz, 2));
+		double rzLength = Math.sqrt(Math.pow(rzx, 2) + Math.pow(rzy, 2) + Math.pow(rzz, 2));
+		
 		
 		Double a1 = relPoint.getX();
 		Double a2 = relPoint.getY();
@@ -504,10 +733,6 @@ public class Query implements QueryInterface {
 		private Double y;
 		private Double z;
 		public Point() { }
-		public Point(Double x, Double y) {
-			this.x = x;
-			this.y = y;
-		}
 		public Point(Double x, Double y, Double z) {
 			this.x = x;
 			this.y = y;
