@@ -4,7 +4,7 @@ QueryGeneratorforBIMserver0.2
 The query generator generates the java query code automatically, and can be queried by bimserver.
 This is the second release. The initial release url is: https://github.com/jjsahalf/BimServerQueryGenerator.
 
-In this version, the GUI is changed a little bit. We also add more functionalities to run customized query on the basis of the information exchange requirement, which is represented in MVD or extended MVD. 
+In this version, the GUI is changed a little bit. We also add more functionalities to run customized query on the basis of the information exchange requirement, which is represented in MVD or extended MVD. During the query process, the building information is extracted and transformed into OpenStudio Model from the input IFC model.
 The objective of this version is to integrate BIM Datahub and OpenStudio to potentially facilitate more effective information exchange among different simulation tools and platforms.
 
 It contains the following steps to run the application and conduct various analyses using OpenStudio:
