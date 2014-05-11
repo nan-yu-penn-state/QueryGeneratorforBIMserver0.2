@@ -23,6 +23,10 @@
  as the first input argument and the number is the number after #
  of the entity you are going to analyse.
 
+ If you want to view it in .txt file, then you can use:
+
+ - java Hierachical_IFC ifc_file_name.ifc number >> Filename.txt
+ 
  Goes with the example, you may get the following as a result:
 
  *********************************************************************
